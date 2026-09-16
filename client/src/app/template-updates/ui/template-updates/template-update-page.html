@@ -1,0 +1,24 @@
+<h1>Template updates</h1>
+@switch (store.listState()) {
+  @case ('loading') {
+    <p role="status">Loading engagements…</p>
+  }
+  @case ('error') {
+    <p role="alert">
+      Could not load engagements. <button type="button" (click)="store.loadList()">Retry</button>
+    </p>
+  }
+}
+@if (store.catalogAsOf(); as asOf) {
+  <p>
+    <small>Template catalog as of {{ asOf | date: 'medium' }}</small>
+  </p>
+}
+<app-engagement-update-list
+  [rows]="store.rows()"
+  [selectedId]="store.selectedId()"
+  [pendingCount]="store.pendingCount()"
+  (selected)="store.select($event)"
+/>
+<hr />
+<app-pending-update-panel />

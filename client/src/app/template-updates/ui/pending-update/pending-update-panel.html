@@ -1,0 +1,69 @@
+@if (store.notice(); as notice) {
+  <p role="alert">{{ notice }}</p>
+}
+
+@if (store.detailState() === 'loading' && !store.detail()) {
+  <p role="status">Loading…</p>
+} @else if (store.detailState() === 'error') {
+  <p role="alert">Could not load this engagement's update details.</p>
+} @else if (store.detail(); as d) {
+  <h3>{{ d.engagementName }}</h3>
+  <p>
+    {{ d.templateDisplayName }} — currently on
+    {{ d.currentVersion === null ? 'an unknown version' : 'v' + d.currentVersion }}
+  </p>
+
+  @switch (d.status) {
+    @case ('UP_TO_DATE') {
+      <p>This engagement is up to date with the latest template (v{{ d.latestVersion }}).</p>
+    }
+    @case ('UNKNOWN') {
+      <p>
+        We haven't finished checking this engagement's template version yet. It will appear here
+        automatically.
+      </p>
+    }
+    @case ('UPDATE_AVAILABLE') {
+      @if (accumulated()) {
+        <p>
+          {{ d.pendingVersions.length }} template updates have been published since this engagement
+          was last updated. They are reviewed and applied together:
+        </p>
+      } @else {
+        <p>A template update has been published:</p>
+      }
+      <ul>
+        @for (v of d.pendingVersions; track v.version) {
+          <li>v{{ v.version }} — published {{ v.publishedAt | date: 'mediumDate' }}</li>
+        }
+      </ul>
+
+      @if (d.summary; as summary) {
+        <app-change-summary [summary]="summary" [showVersions]="accumulated()" />
+      }
+
+      @if (d.activeDecision; as decision) {
+        <p role="status">
+          @if (decision.state === 'IN_PROGRESS') {
+            {{ decision.decision === 'APPLY' ? 'Applying' : 'Declining' }} update to v{{
+              decision.toVersion
+            }}… submitted {{ decision.submittedAt | date: 'shortTime' }}.
+          } @else {
+            The last decision failed: {{ decision.failureReason }}
+          }
+        </p>
+      } @else if (d.latestVersion !== null) {
+        <app-decision-actions
+          [toVersion]="d.latestVersion"
+          [disabled]="!store.canDecide()"
+          (decided)="store.decide($event)"
+        />
+      }
+    }
+  }
+  <p>
+    <small>Status as of {{ d.statusAsOf | date: 'medium' }}</small>
+  </p>
+} @else {
+  <p>Select an engagement to review its template updates.</p>
+}

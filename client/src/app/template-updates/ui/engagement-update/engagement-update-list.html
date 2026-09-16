@@ -1,0 +1,36 @@
+<table>
+  <caption>
+    Engagements ({{
+      pendingCount()
+    }}
+    with pending template updates)
+  </caption>
+  <thead>
+    <tr>
+      <th scope="col">Engagement</th>
+      <th scope="col">Template</th>
+      <th scope="col">Version</th>
+      <th scope="col">Template update</th>
+      <th scope="col">As of</th>
+    </tr>
+  </thead>
+  <tbody>
+    @for (row of rows(); track row.engagementId) {
+      <tr [attr.aria-selected]="row.engagementId === selectedId()">
+        <td>
+          <button type="button" (click)="selected.emit(row.engagementId)">
+            {{ row.engagementName }}
+          </button>
+        </td>
+        <td>{{ row.templateDisplayName }}</td>
+        <td>{{ row.currentVersion === null ? '—' : 'v' + row.currentVersion }}</td>
+        <td>{{ statusText(row) }}</td>
+        <td>{{ row.statusAsOf | date: 'medium' }}</td>
+      </tr>
+    } @empty {
+      <tr>
+        <td colspan="5">No engagements.</td>
+      </tr>
+    }
+  </tbody>
+</table>

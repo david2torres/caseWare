@@ -1,0 +1,56 @@
+@switch (summary().availability) {
+  @case ('COMPUTING') {
+    <p role="status">The summary of changes is being prepared. This usually takes a few seconds.</p>
+  }
+  @case ('UNAVAILABLE') {
+    <p role="alert">
+      The summary of changes is not available right now, so this update can't be applied or declined
+      yet. Please try again later.
+    </p>
+  }
+  @case ('READY') {
+    <p>
+      Applying moves this engagement from v{{ summary().fromVersion }} to v{{
+        summary().toVersion
+      }}. {{ summary().items.length }} change(s){{
+        requiredCount() ? ', ' + requiredCount() + ' requiring a response' : ''
+      }}.
+      <small>Summary prepared {{ summary().computedAt | date: 'medium' }}</small>
+    </p>
+    @for (group of groups(); track group.area) {
+      <section>
+        <h4>{{ group.area }}</h4>
+        <ul>
+          @for (item of group.items; track item.changeId) {
+            <li [attr.data-kind]="item.kind">
+              <strong>[{{ kindLabel(item.kind) }}] {{ item.title }}</strong>
+              @if (item.requiresResponse) {
+                <em> — requires a response</em>
+              }
+              @if (item.detail) {
+                <div>{{ item.detail }}</div>
+              }
+              @if (item.before !== null || item.after !== null) {
+                <div>
+                  @if (item.before !== null) {
+                    <span>Before: {{ item.before }}</span>
+                  }
+                  @if (item.after !== null) {
+                    <span> After: {{ item.after }}</span>
+                  }
+                </div>
+              }
+              @if (showVersions() && item.changedInVersions.length) {
+                <div class="versions">Changed in {{ versionsText(item) }}</div>
+              }
+            </li>
+          } @empty {
+            <li>No content changes.</li>
+          }
+        </ul>
+      </section>
+    } @empty {
+      <p>This update contains no content changes.</p>
+    }
+  }
+}

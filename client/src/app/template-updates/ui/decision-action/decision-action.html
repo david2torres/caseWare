@@ -1,0 +1,20 @@
+@if (confirming(); as decision) {
+  <p>
+    {{ decision === 'APPLY' ? 'Apply' : 'Decline' }} the update to v{{ toVersion() }} for this
+    engagement?
+    @if (decision === 'APPLY') {
+      It will be processed in the background and may take a few minutes.
+    }
+  </p>
+  <button type="button" (click)="confirm(decision)" [disabled]="disabled()">
+    Yes, {{ decision === 'APPLY' ? 'apply' : 'decline' }}
+  </button>
+  <button type="button" (click)="confirming.set(null)">Cancel</button>
+} @else {
+  <button type="button" (click)="confirming.set('APPLY')" [disabled]="disabled()">
+    Apply update
+  </button>
+  <button type="button" (click)="confirming.set('DECLINE')" [disabled]="disabled()">
+    Decline update
+  </button>
+}
