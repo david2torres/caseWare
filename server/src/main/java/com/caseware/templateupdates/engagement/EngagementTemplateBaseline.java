@@ -41,8 +41,8 @@ public record EngagementTemplateBaseline(
         return new EngagementTemplateBaseline(id, name, templateId, null, null, null);
     }
 
-    public static EngagementTemplateBaseline withDeclinedThrough(int id) {
-        return new EngagementTemplateBaseline(engagementId, engagementName, templateId, baselineVersion, id, indexedAt);
+    public EngagementTemplateBaseline withDeclinedThrough(int version) {
+        return new EngagementTemplateBaseline(engagementId, engagementName, templateId, baselineVersion, version, indexedAt);
     }
 
     public OptionalInt baseline() {
