@@ -20,10 +20,8 @@ class PendingUpdateEvaluatorTest {
 
     @Test
     void accumulatedVersionsAreAllPendingAndTargetIsTheLatest() {
-        // ENG-1007 Bluewater Hospitality: REVIEW-CA v6, while v7 and v8 have been
-        // published.
-        var eng = EngagementTemplateBaseline.indexed("ENG-1007", "Bluewater Hospitality 2026", "REVIEW-CA", 6,
-                INDEXED_AT);
+        // ENG-1007 Bluewater Hospitality: REVIEW-CA v6, while v7 and v8 have been published.
+        var eng = EngagementTemplateBaseline.indexed("ENG-1007", "Bluewater Hospitality 2026", "REVIEW-CA", 6, INDEXED_AT);
 
         PendingUpdateState state = evaluator.evaluate(eng, CATALOG_AS_OF);
 
@@ -37,8 +35,7 @@ class PendingUpdateEvaluatorTest {
     @Test
     void engagementOnLatestVersionIsUpToDate() {
         // ENG-1005 Cedar Peak Services: REVIEW-CA v8 (latest).
-        var eng = EngagementTemplateBaseline.indexed("ENG-1005", "Cedar Peak Services 2026", "REVIEW-CA", 8,
-                INDEXED_AT);
+        var eng = EngagementTemplateBaseline.indexed("ENG-1005", "Cedar Peak Services 2026", "REVIEW-CA", 8, INDEXED_AT);
 
         PendingUpdateState state = evaluator.evaluate(eng, CATALOG_AS_OF);
 
@@ -50,25 +47,11 @@ class PendingUpdateEvaluatorTest {
     @Test
     void neverGuessesWhenInformationIsMissingOrInconsistent() {
         var notIndexed = EngagementTemplateBaseline.notYetIndexed("ENG-2001", "Backfill pending", "AUDIT-CA");
-        var aheadOfCatalog = EngagementTemplateBaseline.indexed("ENG-2002", "Created from v6", "AUDIT-CA", 6,
-                INDEXED_AT);
+        var aheadOfCatalog = EngagementTemplateBaseline.indexed("ENG-2002", "Created from v6", "AUDIT-CA", 6, INDEXED_AT);
         var unknownTemplate = EngagementTemplateBaseline.indexed("ENG-2003", "Other product", "RISK-XX", 1, INDEXED_AT);
 
         assertEquals(UnknownReason.NOT_YET_INDEXED, evaluator.evaluate(notIndexed, CATALOG_AS_OF).unknownReason());
         assertEquals(UnknownReason.CATALOG_BEHIND, evaluator.evaluate(aheadOfCatalog, CATALOG_AS_OF).unknownReason());
-        assertEquals(UnknownReason.TEMPLATE_NOT_IN_CATALOG,
-                evaluator.evaluate(unknownTemplate, CATALOG_AS_OF).unknownReason());
-    }
-    
-    @Test
-    void declinedUpdateIsNotPendingUntilANewerVersionIsPublished() {
-        var eng = EngagementTemplateBaseline
-                .indexed("ENG-1006", "Westmount Consulting 2026", "REVIEW-CA", 7, INDEXED_AT)
-                .withDeclinedThrough(8);
-
-        PendingUpdateState state = evaluator.evaluate(eng, CATALOG_AS_OF);
-
-        assertEquals(UpdateStatus.UP_TO_DATE, state.status());
-        assertTrue(state.pendingVersions().isEmpty());
+        assertEquals(UnknownReason.TEMPLATE_NOT_IN_CATALOG, evaluator.evaluate(unknownTemplate, CATALOG_AS_OF).unknownReason());
     }
 }

@@ -1,194 +1,263 @@
 # Design: Pending Template Updates
 
-## 1. High-level architecture
+Users must see at a glance which engagements have pending template updates, and read a human-readable summary of the
+inbound changes before applying or declining. The binding constraint is that an engagement's current template version
+can only be read by **rehydrating the file (~1 min)**, which can never appear on the read path.
 
-**Core idea.** Loading an engagement costs ~1 minute, so we must never load engagements to answer "what is pending?".
-We keep a small per-firm **engagement template index** (engagement → template + baseline version), maintained by hooks,
-and a shared **template catalog** (template → published versions). Pending state is then a pure, in-memory comparison
-computed **on read**. Summaries are derived from diffs that are shared by all firms.
+**Core decision.** Keep a small, queryable **projection** of the one fact we need — engagement → template + version —
+inside each firm's own data boundary, maintained by events. Pending state is then a **comparison, not a load**:
+`latestPublishedVersion > engagementBaselineVersion`. Everything else follows from that.
+
+## 1. Target architecture
 
 ```mermaid
 flowchart LR
-  subgraph Shared["Shared (all firms)"]
-    TDB[(Template DB)]
+  subgraph Shared["Shared content plane (no client data, replicated read-only per region)"]
     TS[Template storage system]
-    DW[Diff worker]
-    DC[(Diff cache<br/>templateId, from, to)]
-    CAT[(Template catalog<br/>projection)]
+    TDB[(Template DB)]
+    CAT[(Version catalog)]
+    DW[Diff/summary worker]
+    DC[(Diff + summary cache<br/>templateId, from, to)]
   end
-  subgraph Firm["Per firm"]
-    ES[Engagement management system<br/>load ~1 min]
-    IDX[(Engagement template index<br/>baseline, declinedThrough,<br/>activeDecision, indexedAt)]
-    US[Template Update Service<br/>Java]
+
+  subgraph FirmPlane["Firm plane — isolated stack per firm, in the firm's region"]
+    ES[Engagement system<br/>rehydrate ~1 min]
+    IDX[(Engagement index<br/>baseline, declinedThrough,<br/>activeDecision, indexedAt)]
+    LOG[(Decision log<br/>append-only)]
+    US[Update Service]
   end
-  UI[Angular client]
+
+  UI[Engagement list UI]
 
   TS -- writes --> TDB
-  TS -- TemplateVersionPublished --> DW
   TS -- TemplateVersionPublished --> CAT
-  DW -- diff tool --> DC
+  TS -- TemplateVersionPublished --> DW
+  DW --> DC
+  CAT -- publish event --> US
   ES -- EngagementCreated / DecisionCompleted --> IDX
-  UI -- REST, polling --> US
+  UI -- REST --> US
   US --> IDX
-  US --> CAT
-  US --> DC
+  US --> LOG
+  US -- read-only --> CAT
+  US -- read-only --> DC
   US -- DecisionRequested --> ES
 ```
 
-**Server responsibilities (Template Update Service, Java).**
-- Evaluate pending state per engagement from index + catalog (`PendingUpdateEvaluator`). Hundreds of rows × an in-memory
-  catalog is microseconds, so there is **no fan-out** to every engagement of every firm when a template is published.
-- Build the **human-readable summary** from raw diffs (`ChangeDescriber`, `PendingUpdateSummaryService`).
-- Accept decisions with optimistic concurrency, record them as `activeDecision`, and hand them to the engagement system,
-  which does the slow load and emits `DecisionCompleted`.
-- Represent every "not known yet" state explicitly (`UNKNOWN`, `COMPUTING`, `UNAVAILABLE`) rather than guessing.
+**Two planes, one direction of flow.** The content plane holds templates, the version catalog and derived diffs; none of
+it is client data, so it can be shared and replicated. The firm plane holds which engagement is on which version, which
+_is_ client-confidential. **Data only ever flows content → firm.** No firm identifier, engagement identifier or pending
+state is written into the shared template store, preserving the property that it retains nothing about engagement files.
 
-**Client responsibilities (Angular).** Presentation and interaction state only: list, selection, review, confirmation,
-polling, and reacting to `409`. It never interprets JSON diffs. Implementation based on Clean Architecture and SOLID principles.
+**Read path (no engagement loads).**
 
-**Where the raw diff becomes human-readable: the server.** Reasons: (1) wording needs template vocabulary
-(section display names) that lives with the templates, not in the browser; (2) the summary shown when a practitioner
-applies is part of a defensible audit trail, so it must be deterministic, versioned and reproducible server-side
-(we store a hash of the summary with the decision); (3) one implementation serves every client (web, notifications,
-future e-mail digests) and localisation (English/French for Canada) via `Accept-Language`; (4) the rules are unit-tested
-in Java against golden diffs from the content team. Trade-off: wording changes require a backend deploy.
+- `GET /engagements/template-updates` → the Update Service reads the firm's index (hundreds of rows) plus the in-memory
+  catalog and evaluates pending state **on read**. There is no fan-out write when a version is published, so one publish
+  affecting every firm costs nothing on the write side.
+- `GET /engagements/{id}/template-updates/pending` → the net diff **baseline → latest** from the shared cache, rendered
+  as human-readable change items.
 
-**Accumulated updates.** An engagement on v6 with v7 and v8 published has **one** pending update to the latest version.
-Apply is all-or-nothing to latest (intermediate versions are not offered: that is what the content team supports).
-The summary is the **net** diff baseline → latest, requested directly from the diff tool (so 0.15 → 0.12 → 0.10 reads as
-0.15 → 0.10), and each item is annotated with `changedInVersions` using the consecutive diffs. We do not compose diffs
-ourselves; the diff tool is the reliable source. **Decline** records `declinedThroughVersion = latest`; the engagement is
-pending again only when a newer version is published, and its summary is still computed from the real baseline
-(content never moved), with items newer than the declined version highlighted.
+**Write path (index maintenance).** Hooks on the engagement system emit `EngagementCreated {templateId, version}` and
+`TemplateDecisionCompleted {decision, toVersion}`; the index is upserted from those. Pre-existing engagements are
+covered by a **one-off throttled backfill** — the only place we pay the 1-minute load, offline and off the read path.
+Until a row is backfilled it reports `UNKNOWN / NOT_YET_INDEXED`: we never guess "up to date".
 
-**Freshness.** On publish, the catalog projection updates within seconds; the next client poll shows it. Every row carries
-`statusAsOf` and responses carry `catalogAsOf`. Polling (60 s, plus on tab focus; 3 s while something is `COMPUTING` or
-`IN_PROGRESS`) is enough for ~1 publish/week/product. Push (SSE/WebSocket) is a later optimisation, not a requirement.
+**Accumulated updates.** An engagement on v6 with v7 and v8 published has **one** pending update, targeting the latest.
+The summary is the **net** diff v6 → v8 (so 0.15 → 0.12 → 0.10 reads as 0.15 → 0.10), each item annotated with the
+versions that touched it, taken from the consecutive diffs. Apply is all-or-nothing to latest. **Decline** records
+`declinedThroughVersion`, so the engagement returns to pending only when something newer is published, and its summary
+still starts from the real baseline because the content never moved.
+
+**The human-readable transformation happens server-side**, in the shared worker and Update Service: it needs template
+vocabulary (section display names live in the template), it must be deterministic and reproducible for audit ("what did
+the practitioner see when they applied?"), it serves every client and locale, and it is unit-testable against golden
+diffs. Raw JSON pointers reach the client only as a `technicalPath` used for support.
 
 ## 2. Implementation plan
 
-1. **Hooks & events** (template storage + engagement system): `TemplateVersionPublished`, `EngagementCreated
-   {templateId, version}`, `TemplateDecisionCompleted {decision, toVersion}`. AWS: EventBridge → SQS per consumer.
-2. **Catalog projection + diff worker** (shared): on publish, upsert catalog; precompute diffs `vK → vNew` for all recent K
-   (≤ ~52/year, each quick) into the diff cache (DynamoDB/S3). Unknown pairs are computed lazily (`COMPUTING`).
-3. **Engagement template index** (firm DB) + **backfill** job: throttled, parallel, off-hours load of existing engagements
-   (hours for hundreds of files). Rows are `UNKNOWN / NOT_YET_INDEXED` until done.
-4. **Template Update Service** endpoints (contract below), evaluator, describer, decision command.
-5. **Angular** list/detail/decision UI behind a gateway interface (fake first, HTTP later).
-6. Rollout behind a feature flag per firm after backfill completes; shadow-compare index vs sampled engagement loads.
+1. **Events**: `TemplateVersionPublished` from the template store; `EngagementCreated` / `TemplateDecisionCompleted`
+   from the engagement system (EventBridge → per-consumer SQS, DLQ on each).
+2. **Content plane**: catalog projection; diff worker precomputing consecutive pairs plus `vK → vNew` for recent K on
+   each publish (≤ ~52/year per product, each quick); any other pair computed lazily and surfaced as `COMPUTING`.
+3. **Firm plane**: per-firm index table and decision log; Update Service with the evaluator and summary renderer
+   (Part 2 code); decision endpoint with optimistic concurrency.
+4. **Backfill** per firm: throttled, resumable, progress exposed; a feature flag enables the firm when it completes.
+5. **Observability and alarms** (§4) in place before general availability; shadow-compare the index against sampled
+   rehydrations.
+6. Roll out firm by firm, smallest first.
 
 ## 3. Testing strategy
 
-- **Unit (Java):** evaluator edge cases (up to date, accumulated, not indexed, catalog behind); describer **golden tests**
-  (raw diff → expected sentence) curated with the content team; summary service states (READY/COMPUTING/UNAVAILABLE).
-- **Consistency check:** for sampled template pairs, the set of paths in `diff(a, c)` equals the net effect of
-  `diff(a, b)` + `diff(b, c)`; catches diff-tool or attribution regressions.
-- **Contract:** OpenAPI is the source; TS types and Java DTOs are generated and checked in CI (consumer tests on the client).
-- **Integration:** event handlers are idempotent and order-tolerant (duplicate/out-of-order publish, decision completed twice).
-- **Client:** store tests for `409` stale decisions and polling; component tests that "computing" is never rendered as
-  "no changes".
-- **E2E (staging):** publish a test template → engagement shows pending within SLA → apply → up to date.
+- **Unit**: evaluator edge cases (up to date, accumulated, not indexed, catalog behind, previously declined);
+  **golden tests** for every wording rule (raw diff → expected sentence), curated with the content team; sweep counts.
+- **Consistency**: for sampled version pairs, the paths in `diff(a, c)` match the net effect of `diff(a, b) + diff(b, c)`.
+- **Contract**: OpenAPI is the source of truth; client types and server DTOs are generated and diffed in CI.
+- **Integration**: idempotent, order-tolerant event handling (duplicate publish, out-of-order decisions, replays).
+- **Isolation tests as first-class citizens**: automated tests assert that a token scoped to firm A cannot read firm B's
+  index or decision log, run against real IAM policies rather than mocks, so isolation is verified structurally.
+- **Load**: a publish affecting every firm at once; list latency for the largest firm; backfill concurrency limits.
+- **E2E in staging**: publish a template → the firm's list shows it pending within SLA → apply → decision recorded.
 
 ## 4. Evaluation & observability
 
-- **Freshness SLOs:** publish → catalog updated (p95 < 1 min); publish → summaries READY; age of `catalogAsOf`.
-- **Correctness:** nightly **reconciliation** samples engagements (slow load) and compares the file's version to the index
-  → `index_drift_count`; `UNKNOWN` rows by reason; backfill progress.
-- **Summary quality:** % of changes hitting the generic fallback (`itemType = OTHER`) → tells us which template paths need
-  wording rules; in-product "Was this summary clear?" feedback; periodic review of summaries with the content team.
-- **Decisions:** duration, failure rate, `409` rate (users racing publishes), abandoned `IN_PROGRESS`.
-- **AI (if added):** an optional LLM "why this matters" note generated at publish time, reviewed by the content team before
-  release, labelled as AI-assisted, evaluated against a golden set. It never produces the before/after values, counts or
-  the pending state, which remain deterministic.
+The three operational questions, answered by design:
 
-## 5. Failure modes & trade-offs
+| Question                                            | Mechanism                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **How many engagements does a new version affect?** | On `TemplateVersionPublished`, each firm plane runs a **sweep** over its index (no file loads) emitting `UpdateImpact {firmId, templateId, version, engagementsOnTemplate, affected, unknown}` — see `FirmUpdateSweep` in Part 2. Aggregated across firms, it gives the blast radius of a publish within seconds.                                       |
+| **Is the check running for every firm?**            | The sweep's `checkedAt` is a **per-firm heartbeat**. A dashboard lists every active firm with its last successful sweep and its event-consumer lag, and alarms when a firm has no sweep for a published version — a silently stalled tenant is visible without a user reporting it. A synthetic canary firm per region exercises the whole path hourly. |
+| **What is a firm's apply/decline history?**         | An append-only **decision log** per firm: `who, when, engagement, from → to, decision, summary hash, outcome`. It is both the audit record and the source of decision metrics (rate, latency, failures).                                                                                                                                                |
 
-| Failure | Handling |
-|---|---|
-| Lost / duplicate / out-of-order events | Idempotent upserts keyed by version (keep max); hourly catalog reconciliation against template DB (cheap). |
-| Index drift (engagement changed without hook, restore from backup) | Hooks on all version-changing paths; nightly sampling reconciliation; `indexedAt` exposed. |
-| Diff not ready / diff tool down | `COMPUTING` / `UNAVAILABLE`; Apply/Decline disabled: we don't let users decide blind. |
-| New version published during review | Decision carries `fromVersion/toVersion`; server returns `409`; client refreshes summary. |
-| Decision processing fails (1-min load) | `activeDecision.state = FAILED` with reason; retry is idempotent by `(engagementId, toVersion)`. |
-| Backfill takes hours | Rows show "not scanned yet", never a wrong "up to date". |
-| Unrecognised diff path | Generic but readable fallback + metric; technical path kept for support. |
+Other signals: freshness SLOs (publish → catalog updated, p95 < 1 min; publish → summaries READY); `unknownRatio` per
+firm (index gaps); backfill progress; `409` rate (users racing publishes); the **share of changes hitting the generic
+wording fallback**, which shows where the human-readable rules need extending; and in-product "was this summary clear?"
+feedback. Correctness is guarded by a nightly **reconciliation** that rehydrates a small sample of engagements and
+compares their real version against the index, alarming on drift — the only routine use of the slow path.
 
-**Key trade-offs.** Compute-on-read (simple, always consistent, no fan-out) over materialised pending flags (would need
-writes to every firm per publish). Polling over push (simpler; adequate for weekly publishes). Server-side summaries
-(consistent, auditable) over client-side (more flexible UI iteration). Net summary with attribution over per-version
-summaries (matches what Apply does; less reading for users). Blocking decisions without a summary (safer, but an outage
-of the diff tool delays decisions).
+**On AI.** Pending state and every number in a summary are deterministic. If we add LLM assistance, it is an optional
+"why this matters" note generated at publish time, reviewed by the content team before release and labelled as
+AI-assisted — never generated per request and never producing values or the apply/decline state, since non-deterministic
+text would break the audit trail.
+
+## 5. Security
+
+- **Isolation as a structural property.** Pending-update state lives inside the firm's existing engagement data boundary
+  — its own table and stack, in its own account and region — not in a shared table filtered by `firm_id`. Access is
+  granted by IAM scoped to that resource (and where a shared table is unavoidable, by `dynamodb:LeadingKeys` conditions
+  binding a role to its own partition), so a missing `WHERE` clause cannot leak across firms. Per-firm KMS keys encrypt
+  data at rest. Cross-firm access is not merely filtered out, it is unauthorized.
+- **Authorization.** The Update Service reuses the engagement system's existing entitlements: a user sees pending updates
+  only for engagements they can already open, and only a user permitted to modify an engagement can apply or decline it.
+  The feature must not become a backdoor that lists engagements a user cannot otherwise see.
+- **Data residency.** The firm plane is deployed in the firm's existing region and its data never leaves it. The content
+  plane holds no client data, so it is replicated read-only into each region; residency holds because only
+  template-derived, non-confidential artefacts cross regions, and only in that direction.
+- **Leakage direction.** Diffs and summaries derive from shared templates and are identical for every firm, so they are
+  safe to share. Pending state derives from client data and never leaves the firm plane. Metrics are aggregated per firm
+  with identifiers only, never content.
+
+## 6. Failure modes & tradeoffs
+
+| Failure                                                  | Handling                                                                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Lost / duplicate / out-of-order events                   | Idempotent upserts keyed by version (keep max); DLQ and replay; periodic catalog reconciliation against the template DB. |
+| Index drift (restore from backup, a path without a hook) | Nightly sampled-rehydration reconciliation; `indexedAt` surfaced in the contract; drift alarms.                          |
+| Diff not ready or diff service down                      | `COMPUTING` / `UNAVAILABLE` are explicit contract states; decisions are blocked rather than made blind.                  |
+| New version published mid-review                         | Decisions carry `fromVersion/toVersion`; the server responds `409`; the client re-reads the refreshed summary.           |
+| Decision processing fails (the slow path)                | `activeDecision.state = FAILED` with a reason; retry is idempotent per `(engagementId, toVersion)`.                      |
+| A publish storms every firm at once                      | Sweeps are queued per firm with jitter and concurrency caps; they are observability-only, so lag never affects the UI.   |
+| Backfill incomplete                                      | Rows read `UNKNOWN / NOT_YET_INDEXED` with progress shown — never a false "up to date".                                  |
+| Noisy neighbour (a very large firm)                      | Per-firm quotas and isolated stacks; one firm's backfill or sweep cannot starve another.                                 |
+
+**Tradeoffs taken.** Compute-on-read over materialised per-engagement flags: simpler and always consistent, and a publish
+touching every firm costs no writes; the price is a slightly heavier read, trivial at hundreds of rows. Per-firm stacks
+over a single shared multi-tenant table: stronger isolation and residency, at the cost of more infrastructure to operate.
+A net summary over per-version summaries: it matches what Apply does and reads better, with intermediate churn visible
+only as version attribution. Blocking decisions without a READY summary: safer, but a diff outage delays users. Polling
+(60 s, faster while something is computing) over push: adequate for weekly publishes, with SSE as a later upgrade.
 
 ---
 
-## API contract
+## Appendix A: API contract
 
-All timestamps ISO-8601 UTC. Firm and user come from the auth context. Types match `client/.../template-updates.contract.ts`
-and the Java model (`PendingUpdateState`, `ChangeSummary`, `ChangeItem`).
+All timestamps are ISO-8601 UTC; firm and user come from the auth context, never from the request body.
 
-| Method & path | Response |
-|---|---|
-| `GET /api/engagements/template-updates` | `200 EngagementUpdateListResponse` (supports `ETag` / `304`) |
-| `GET /api/engagements/{id}/template-updates/pending` | `200 PendingUpdateDetail` |
-| `POST /api/engagements/{id}/template-updates/decisions` | `202 DecisionAccepted` · `409 StaleDecisionProblem` · `422` if summary not READY |
+| Method & path                                           | Response                                                                                |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `GET /api/engagements/template-updates`                 | `200 EngagementUpdateListResponse` (`ETag` / `304`)                                     |
+| `GET /api/engagements/{id}/template-updates/pending`    | `200 PendingUpdateDetail`                                                               |
+| `POST /api/engagements/{id}/template-updates/decisions` | `202 DecisionAccepted` · `409 StaleDecisionProblem` · `422` if the summary is not READY |
 
 ```ts
-type UpdateStatus = 'UP_TO_DATE' | 'UPDATE_AVAILABLE' | 'UNKNOWN';
-type UnknownReason = 'NOT_YET_INDEXED' | 'TEMPLATE_NOT_IN_CATALOG' | 'CATALOG_BEHIND';
-
-interface PublishedVersion { version: number; publishedAt: string }
-
-interface ActiveDecision {
-  decisionId: string; decision: Decision; toVersion: number;
-  state: 'IN_PROGRESS' | 'FAILED'; submittedAt: string; failureReason: string | null;
-}
+type UpdateStatus = "UP_TO_DATE" | "UPDATE_AVAILABLE" | "UNKNOWN";
+type UnknownReason =
+  | "NOT_YET_INDEXED"
+  | "TEMPLATE_NOT_IN_CATALOG"
+  | "CATALOG_BEHIND";
 
 interface EngagementUpdateListResponse {
   items: EngagementUpdateStatus[];
-  catalogAsOf: string;            // last publish event reflected
+  catalogAsOf: string; // last publish event reflected
   generatedAt: string;
 }
 
 interface EngagementUpdateStatus {
-  engagementId: string; engagementName: string;
-  templateId: string; templateDisplayName: string;
+  engagementId: string;
+  engagementName: string;
+  templateId: string;
+  templateDisplayName: string;
   status: UpdateStatus;
-  unknownReason: UnknownReason | null;     // set iff status = UNKNOWN
-  currentVersion: number | null;           // null = not known yet (never guessed)
+  unknownReason: UnknownReason | null; // set iff status = UNKNOWN
+  currentVersion: number | null; // null = not known yet (never guessed)
   latestVersion: number | null;
-  pendingVersions: PublishedVersion[];     // oldest first; length > 1 = accumulated
+  pendingVersions: { version: number; publishedAt: string }[]; // oldest first; >1 = accumulated
   activeDecision: ActiveDecision | null;
   declinedThroughVersion: number | null;
-  statusAsOf: string;                      // older of index time and catalogAsOf
+  statusAsOf: string; // older of index time and catalogAsOf
+}
+
+interface ActiveDecision {
+  decisionId: string;
+  decision: "APPLY" | "DECLINE";
+  toVersion: number;
+  state: "IN_PROGRESS" | "FAILED";
+  submittedAt: string;
+  failureReason: string | null;
 }
 
 interface PendingUpdateDetail extends EngagementUpdateStatus {
-  summary: ChangeSummary | null;           // null unless UPDATE_AVAILABLE
+  summary: ChangeSummary | null; // null unless UPDATE_AVAILABLE
 }
 
 interface ChangeSummary {
-  availability: 'READY' | 'COMPUTING' | 'UNAVAILABLE';
-  fromVersion: number; toVersion: number;  // baseline -> latest (net)
-  items: ChangeItem[];                     // empty unless READY
+  availability: "READY" | "COMPUTING" | "UNAVAILABLE";
+  fromVersion: number;
+  toVersion: number; // baseline -> latest (net)
+  items: ChangeItem[]; // empty unless READY
   computedAt: string | null;
   unavailableReason: string | null;
 }
 
 interface ChangeItem {
   changeId: string;
-  kind: 'ADDED' | 'MODIFIED' | 'REMOVED';
-  itemType: 'QUESTION' | 'CHECKLIST' | 'PROCEDURE' | 'SETTING' | 'TEMPLATE_DETAILS' | 'OTHER';
-  area: string;                            // "Materiality"
-  title: string;                           // "Threshold percent decreased"
+  kind: "ADDED" | "MODIFIED" | "REMOVED";
+  itemType:
+    | "QUESTION"
+    | "CHECKLIST"
+    | "PROCEDURE"
+    | "SETTING"
+    | "TEMPLATE_DETAILS"
+    | "OTHER";
+  area: string; // "Materiality"
+  title: string; // "Threshold percent decreased"
   detail: string | null;
-  before: string | null; after: string | null;   // already formatted for display
-  changedInVersions: number[];             // empty = attribution unknown
+  before: string | null;
+  after: string | null; // already formatted for display
+  changedInVersions: number[]; // empty = attribution unknown
   requiresResponse: boolean;
-  technicalPath: string;                   // raw JSON pointer, support only
+  technicalPath: string; // raw JSON pointer, support only
 }
 
-type Decision = 'APPLY' | 'DECLINE';
-interface DecisionRequest { decision: Decision; fromVersion: number; toVersion: number }
-type DecisionAccepted = ActiveDecision;
-interface StaleDecisionProblem { error: 'STALE_UPDATE'; currentVersion: number; latestVersion: number }
+interface DecisionRequest {
+  decision: "APPLY" | "DECLINE";
+  fromVersion: number;
+  toVersion: number;
+}
+interface StaleDecisionProblem {
+  error: "STALE_UPDATE";
+  currentVersion: number;
+  latestVersion: number;
+}
 ```
+
+## Appendix B: implemented slice (Part 2)
+
+`server/` holds plain Java 21 with JUnit 5 (`mvn test`, 8 tests) covering the parts where correctness is easiest to get
+wrong:
+
+- `PendingUpdateEvaluator` — pending state from index + catalog, including accumulation and the three `UNKNOWN` cases.
+- `ChangeDescriber` / `PendingUpdateSummaryService` — raw JSON-Patch diff → human-readable items; net summary with
+  per-version attribution; explicit `COMPUTING` / `UNAVAILABLE` states.
+- `FirmUpdateSweep` — the per-firm impact count and heartbeat described in §4.
+
+Ports (`TemplateCatalog`, `TemplateDiffSource`) keep the logic free of persistence and HTTP; the tests supply in-memory
+implementations built from sample template and diff data.

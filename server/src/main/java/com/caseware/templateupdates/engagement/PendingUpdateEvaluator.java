@@ -11,13 +11,10 @@ import java.util.OptionalInt;
 
 /**
  * Pure logic: (engagement baseline, template catalog) -> pending update state.
- * No I/O and no engagement-file loading, so it is cheap enough to run for every
- * engagement on every list request.
+ * No I/O and no engagement-file loading, so it is cheap enough to run for every engagement on every list request.
  *
- * Assumption for this excerpt (per the brief): no apply/decline history; the
- * recorded version is the baseline.
- * With history, "is pending" would compare latest against max(appliedVersion,
- * declinedThroughVersion).
+ * Assumption for this excerpt (per the brief): no apply/decline history; the recorded version is the baseline.
+ * With history, "is pending" would compare latest against max(appliedVersion, declinedThroughVersion).
  */
 public final class PendingUpdateEvaluator {
 
@@ -45,27 +42,19 @@ public final class PendingUpdateEvaluator {
 
         int latest = entry.latestVersion();
         if (current > latest) {
-            // Engagement was created from a version our catalog projection hasn't received
-            // yet.
+            // Engagement was created from a version our catalog projection hasn't received yet.
             // Answering "up to date" would be a guess; surface it instead.
             return unknown(engagement, UnknownReason.CATALOG_BEHIND, current, latest, asOf);
         }
 
         List<TemplateVersion> pending = entry.versionsAfter(current);
-        Integer declined = engagement.declinedThroughVersion();
-
-        if (declined != null && latest <= declined) {
-            pending = List.of();
-        }
-
         UpdateStatus status = pending.isEmpty() ? UpdateStatus.UP_TO_DATE : UpdateStatus.UPDATE_AVAILABLE;
-
         return new PendingUpdateState(engagement.engagementId(), engagement.templateId(), status, null,
                 current, latest, pending, asOf);
     }
 
     private static PendingUpdateState unknown(EngagementTemplateBaseline e, UnknownReason reason,
-            Integer current, Integer latest, Instant asOf) {
+                                              Integer current, Integer latest, Instant asOf) {
         return new PendingUpdateState(e.engagementId(), e.templateId(), UpdateStatus.UNKNOWN, reason,
                 current, latest, List.of(), asOf);
     }
